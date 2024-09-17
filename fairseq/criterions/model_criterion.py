@@ -53,8 +53,45 @@ class ModelCriterion(FairseqCriterion):
         self.can_sum = can_sum
 
     def forward(self, model, sample, reduce=True):
-        net_output = model(**sample["net_input"])
+        
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
 
+        start.record()
+        
+        # compute peak memory in the following step
+        torch.cuda.reset_peak_memory_stats()
+
+        ####################### operation to be measured #######################
+        
+        # activate to test performance on different lengths
+        #lengths_to_consider = torch.randint(32_000, sample["net_input"]["source"].size(1), (1,)).item()
+        net_output = model(**sample["net_input"]) #lengths_to_consider=lengths_to_consider)
+
+        end.record()
+
+        # Wait for everything to finish running
+        torch.cuda.synchronize()
+
+
+##################### performance measurement #####################
+### uncomment the following code to measure performance
+####################################################################
+        # timesteps = samples["net_input"]["src_tokens"].size(1)
+#        batch_size = sample["net_input"]["source"].size(0)
+#        timesteps = lengths_to_consider
+#        peak_memory = torch.cuda.max_memory_allocated() / (1024 ** 2)
+#        elapsed_time_s = start.elapsed_time(end) / 1000
+#        
+#        with open("results.csv", "a") as f:
+#            f.write(f"{timesteps},{peak_memory / batch_size},{elapsed_time_s / batch_size}\n")
+#        # print(f"timesteps: {timesteps}, peak memory: {peak_memory}, elapsed time: {elapsed_time_s}")
+#
+
+##################### performance measurement END ##################
+####################################################################
+        
+        
         scaled_losses = {}
 
         if hasattr(model, "get_losses"):

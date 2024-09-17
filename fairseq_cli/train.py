@@ -41,6 +41,8 @@ from fairseq.model_parallel.megatron_trainer import MegatronTrainer
 from fairseq.trainer import Trainer
 
 
+from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
+
 def main(cfg: FairseqConfig) -> None:
     if isinstance(cfg, argparse.Namespace):
         cfg = convert_namespace_to_omegaconf(cfg)
@@ -147,6 +149,7 @@ def main(cfg: FairseqConfig) -> None:
     if cfg.common.model_parallel_size == 1:
         trainer = Trainer(cfg, task, model, criterion, quantizer)
     else:
+        logger.info("inside megatron trainer")
         trainer = MegatronTrainer(cfg, task, model, criterion)
     logger.info(
         "training on {} devices (GPUs/TPUs)".format(
@@ -329,6 +332,9 @@ def train(
             "train_step-%d" % i
         ):
             log_output = trainer.train_step(samples)
+            # profiler.step()
+
+
 
         if log_output is not None:  # not OOM, overflow, ...
             # log mid-epoch stats
@@ -550,7 +556,6 @@ def get_valid_stats(
             stats[cfg.checkpoint.best_checkpoint_metric],
         )
     return stats
-
 
 def cli_main(
     modify_parser: Optional[Callable[[argparse.ArgumentParser], None]] = None
