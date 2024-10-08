@@ -800,7 +800,7 @@ class Trainer(object):
         self.model.train()
         self.criterion.train()
         self.zero_grad()
-
+        
         metrics.log_start_time("train_wall", priority=800, round=0)
 
         # If EMA is enabled through store_ema=True

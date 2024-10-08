@@ -103,6 +103,7 @@ class _FP16OptimizerMixin(object):
         function additionally dynamically scales the loss to avoid gradient
         underflow.
         """
+
         if self.scaler is not None:
             loss = self.scaler.scale(loss)
         loss.backward()

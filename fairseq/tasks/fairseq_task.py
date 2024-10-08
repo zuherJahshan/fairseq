@@ -18,7 +18,6 @@ from fairseq.dataclass.utils import gen_parser_from_dataclass
 from fairseq.optim.amp_optimizer import AMPOptimizer
 from omegaconf import DictConfig
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -517,7 +516,6 @@ class FairseqTask(object):
             optimizer (~fairseq.optim.FairseqOptimizer): the optimizer
             update_num (int): the current update
             ignore_grad (bool): multiply loss by 0 if this is set to True
-
         Returns:
             tuple:
                 - the loss
@@ -534,6 +532,7 @@ class FairseqTask(object):
             loss *= 0
         with torch.autograd.profiler.record_function("backward"):
             optimizer.backward(loss)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
         return loss, sample_size, logging_output
 
     def valid_step(self, sample, model, criterion):
