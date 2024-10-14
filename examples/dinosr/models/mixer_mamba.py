@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from mamba_ssm import MambaLMHeadModel, MambaConfig
 import glob
 from tqdm import tqdm
@@ -6,32 +7,36 @@ import whisper
 import torchaudio
 import os
 from transformers import GPT2Tokenizer
-
+import csv
+from fairseq.models.wav2vec import ConvFeatureExtractionModel
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self, base_audio, base_transcripts, device, tokenizer = None):
-        print("Loading dataset filepaths...")
+    def __init__(self, database_file, device, tokenizer = None):
+        print("Loading dataset file...")
         # audiofiles = glob.glob(f'base_audio/**/*.flac', recursive=True)
-        audiofiles = glob.glob(f'{base_audio}/*.flac', recursive=True)
+        
+        """
+        the database_file is a csv file that contains two columns,
+        the first column is the path to the audio file,
+        and the second column is the path to the transcript file.
+        Load this file as a list of tuples,
+        where the first element of the tuple is the path to the audio file,
+        and the second element is the path to the transcript file.
+        """
+        self.file_dataset = []
+        with open(database_file, 'r') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                self.file_dataset.append((row[0], row[1]))
+
         self.device = device
 
-        self.file_dataset = []
-
-        # Check that for every audio file there is a corresponding transcript file
-        for audiofile in tqdm(audiofiles):
-            transcript_file = audiofile.replace(base_audio, base_transcripts).replace('.flac', '.txt')
-            if not os.path.exists(transcript_file):
-                raise ValueError(f"Transcript file for {audiofile} not found, in {transcript_file}")
-            else:
-                self.file_dataset.append((audiofile, transcript_file))
-        print("Dataset filepaths loaded successfully")
-
-        print("Loading tokenizer")
+        print("Loading tokenizer...")
         if tokenizer is None:
             self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2", clean_up_tokenization_spaces=True)
         else:
             self.tokenizer = tokenizer
-        print("Tokenizer loaded successfully")
+        print("Initialization done successfully")
 
     def __len__(self):
         return len(self.file_dataset)
@@ -66,18 +71,33 @@ def collate_fn(batch):
 def main():
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = 'cpu'
-    base_audio = '/workspace/fairseq/data/train_val/unlab_60k/large/17/patient_spider_64kb_mp3/patient_spider_whitman_gm_64kb/'
-    trainscript_base = '/workspace/fairseq/data/results/unlab_60k/large/17/patient_spider_64kb_mp3/patient_spider_whitman_gm_64kb/'
+    dataset_file = "/workspace/fairseq/data/database.csv"
     
-    dataset = Dataset(base_audio, trainscript_base, device)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=128, shuffle=False, collate_fn=collate_fn)
+    dataset = Dataset(dataset_file, device)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=128, shuffle=False, collate_fn=collate_fn, num_workers=8)
 
     for audios, tokens, lengths in tqdm(loader):
         # print(audios.shape, tokens.shape, lengths)
-        print(tokens)
+        pass
+
+
+class mambaModel(nn.Module):
+    def __init__(self, config=None):
+        """
+        input: config - a yaml file defining the configuration of the model
+        output: None
+        Description: This function initializes the model with the given configuration
+        """
+        self.cfg = config
+        self.feature_extractor = ConvFeatureExtractionModel(
+            conv_layers=feature_enc_layers,
+            dropout=0.0,
+            mode=self.cfg.extractor_mode,
+            conv_bias=self.cfg.conv_bias,
+
+        )
+
 
 
 if __name__ == '__main__':
     main()
-
-

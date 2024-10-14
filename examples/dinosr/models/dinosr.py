@@ -126,6 +126,8 @@ class DinosrModel(BaseFairseqModel):
         self.discrete = cfg.discrete
 
         feature_enc_layers = eval(cfg.conv_feature_layers)
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        print(f"feature_enc_layers: {cfg.conv_feature_layers}")
         self.extractor_embed = feature_enc_layers[-1][0]
 
         self.ema = None

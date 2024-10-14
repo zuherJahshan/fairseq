@@ -1,0 +1,26 @@
+_name: dinosr
+model_architecture: mamba
+extractor_mode: layer_norm
+encoder_layerdrop: 0.05
+dropout_input: 0.0
+dropout_features: 0.0
+feature_grad_mult: 1.0
+encoder_embed_dim: 1280
+discrete: true
+codebook_size: 256
+average_top_k_layers: 8
+normal_init_codebook: false
+codebook_init_decay: 0.9
+instance_norm_target_layer: true
+mask_prob: 0.8
+mask_length: 10
+pos_conv_depth: 5
+conv_pos: 95
+ema_decay: 0.999
+ema_end_decay: 0.9999
+ema_anneal_end_step: 30000
+ema_transformer_only: true
+ema_layers_only: true
+require_same_masks: true
+mask_dropout: 0
+conv_feature_enc: [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512,2,2)] + [(512,2,2)]
