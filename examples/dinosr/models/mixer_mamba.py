@@ -65,7 +65,7 @@ def collate_fn(batch):
     )
     # audios have a shape of (audio_length), we need to build a tensor of shape (batch_size, audio_length)
     audios = torch.stack(audios)
-    return audios, padded_tokens, lengths
+    return audios, padded_tokens
 
 
 def main():
@@ -90,14 +90,27 @@ class mambaModel(nn.Module):
         """
         self.cfg = config
         self.feature_extractor = ConvFeatureExtractionModel(
-            conv_layers=feature_enc_layers,
+            conv_layers=eval(self.cfg.feature_enc_layers),
             dropout=0.0,
             mode=self.cfg.extractor_mode,
             conv_bias=self.cfg.conv_bias,
-
         )
+        self.vocab = []
+        with open(self.cfg.vocab_file, 'r') as fvocab:
+            # Open as a csv file
+            reader = csv.reader(fvocab)
+            # all vocabulary could be found in the same row
+            for row in reader:
+                self.vocab = self.vocab + row
+        
+        mamba_cfg = MambaConfig()
+        mamba_cfg.d_model = self.cfg.encoder_embed_dim
+        mamba_cfg.vocab_size = len(self.vocab)
+        mamba_cfg.n_layer = self.cfg.encoder_layers
+        self.encoder = MambaLMHeadModel(mamba_cfg)
 
-
+    def forward(self, audios, tokens):
+        pass
 
 if __name__ == '__main__':
     main()

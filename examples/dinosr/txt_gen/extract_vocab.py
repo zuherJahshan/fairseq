@@ -15,9 +15,7 @@ def main():
             # Open the file and get the transcription.
             with open(transcription_file, 'r') as tfile:
                 transcription = tfile.read()
-                # check if containning a mandarin characters
-                if contains_mandarin(transcription):
-                    print(transcription_file)
+                
                 # Get the characters.
                 chars = set(transcription)
                 detected_chars = detected_chars.union(chars)

@@ -88,3 +88,5 @@ model:
 
   require_same_masks: true
   mask_dropout: 0
+  conv_feature_enc: [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512,2,2)] + [(512,2,2)]
+  vocab_file: /workspace/fairseq/data/vocab.csv 
