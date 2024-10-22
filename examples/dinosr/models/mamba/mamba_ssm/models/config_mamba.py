@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 @dataclass
 class MambaConfig:
 
+    in_features: int = 512
     d_model: int = 2560
     d_intermediate: int = 0
     n_layer: int = 64

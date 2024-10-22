@@ -119,6 +119,7 @@ def _init_weights(
 class MixerModel(nn.Module):
     def __init__(
         self,
+        in_features: int,
         d_model: int,
         n_layer: int,
         d_intermediate: int,
@@ -138,7 +139,7 @@ class MixerModel(nn.Module):
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
 
-        self.embedding = nn.Linear(vocab_size, d_model, **factory_kwargs)
+        self.embedding = nn.Linear(in_features, d_model, **factory_kwargs)
 
         # We change the order of residual and layer norm:
         # Instead of LN -> Attn / MLP -> Add, we do:
@@ -227,6 +228,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         dtype=None,
     ) -> None:
         self.config = config
+        in_features = config.in_features
         d_model = config.d_model
         n_layer = config.n_layer
         d_intermediate = config.d_intermediate
@@ -244,6 +246,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         if vocab_size % pad_vocab_size_multiple != 0:
             vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
         self.backbone = MixerModel(
+            in_features=in_features,
             d_model=d_model,
             n_layer=n_layer,
             d_intermediate=d_intermediate,
@@ -267,7 +270,7 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
                 **(initializer_cfg if initializer_cfg is not None else {}),
             )
         )
-        self.tie_weights()
+        #self.tie_weights()
 
     def tie_weights(self):
         if self.config.tie_embeddings:

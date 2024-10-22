@@ -23,7 +23,10 @@ task:
 
 dataset:
   num_workers: 6
-  max_tokens: 3800000
+  #max_tokens: 3800000
+  batch_size: 2
+  database_file: "/workspace/fairseq/data/small_database.csv"
+  vocab_file: "/workspace/fairseq/data/vocab.csv" 
   skip_invalid_size_inputs_valid_test: true
   validate_interval: 5
   required_batch_size_multiple: 1
@@ -34,12 +37,9 @@ distributed_training:
   ddp_backend: legacy_ddp
 
 criterion:
-  _name: model
-  log_keys:
-    - ema_decay
-    - target_ppl
-    - pred_ppl
-    - codebook_decay
+  name: CTCLoss
+  params:
+    blank: 481
 
 optimization:
   update_freq:
@@ -48,45 +48,21 @@ optimization:
   lr: [0.0005]
 
 optimizer:
-  _name: adam
-  adam_betas: (0.9,0.98)
-  adam_eps: 1e-06
-  weight_decay: 0.01
+  name: Adam
+  params:
+    lr: 0.0005
+    betas: [0.9,0.98]
+    eps: !!float 1e-06
+    weight_decay: 0.01
 
 lr_scheduler:
   _name: tri_stage
   phase_ratio: [0.03,0.47,0.50]
 
 model:
-  _name: dinosr
-  model_architecture: mamba
   extractor_mode: layer_norm
-  encoder_layerdrop: 0.05
-  dropout_input: 0.0
-  dropout_features: 0.0
-  feature_grad_mult: 1.0
-  encoder_embed_dim: 1280
+  encoder_embed_dim: 768
+  fe_dropout: 0.0
 
-  discrete: true
-  codebook_size: 256
-  average_top_k_layers: 8
-  normal_init_codebook: false
-  codebook_init_decay: 0.9
-  instance_norm_target_layer: true
-
-  mask_prob: 0.8
-  mask_length: 10
-
-  pos_conv_depth: 5
-  conv_pos: 95
-
-  ema_decay: 0.999
-  ema_end_decay: 0.9999
-  ema_anneal_end_step: 30000
-  ema_transformer_only: true
-  ema_layers_only: true
-
-  require_same_masks: true
-  mask_dropout: 0
-  conv_feature_enc: [(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512,2,2)] + [(512,2,2)]
-  vocab_file: /workspace/fairseq/data/vocab.csv 
+  conv_feature_enc: "[(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512,2,2)] + [(512,2,2)]"
+  vocab_file: "/workspace/fairseq/data/vocab.csv"
