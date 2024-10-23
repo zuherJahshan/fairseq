@@ -1,4 +1,3 @@
-
 from multiprocessing import set_start_method
 # Set the start method to spawn
 try:
@@ -9,12 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mamba_ssm import MambaLMHeadModel, MambaConfig
-import glob
 from tqdm import tqdm
 import whisper
 import torchaudio
-import os
-from transformers import GPT2Tokenizer
 import csv
 from fairseq.models.wav2vec import ConvFeatureExtractionModel
 import yaml
@@ -24,6 +20,153 @@ from dataclasses import (
 )
 from einops import rearrange
 from enum import Enum
+import unicodedata
+import string
+import editdistance
+from abc import ABC, abstractmethod
+import os
+
+
+class ModelMetric(ABC):
+    def __init__(self, **kwargs):
+        pass
+
+    @abstractmethod
+    def update(self, step, loss, logits, labels, **kwargs):
+        pass
+
+    @abstractmethod
+    def get_name(self):
+        pass
+
+    @abstractmethod
+    def get_value(self):
+        pass
+
+    @abstractmethod
+    def new_val_better(self, old_val, new_val):
+        pass
+
+
+def remove_punctuation(text):
+    """
+    Removes all punctuation from the text, including Unicode punctuation.
+    """
+    # Use a list comprehension to filter out punctuation characters
+    return ''.join(
+        ch for ch in text if ch not in string.punctuation and unicodedata.category(ch)[0] != 'P'
+    )
+
+
+def calculate_wer(references, queries):
+    wer = 0
+    for reference, query in zip(references, queries):
+        # Remove punctuation from both reference and query
+        reference = remove_punctuation(reference)
+        query = remove_punctuation(query)
+
+        # Convert to lowercase
+        reference = reference.lower()
+        query = query.lower()
+
+        # Tokenize the strings into words based on spaces
+        ref_words = reference.strip().split()
+        hyp_words = query.strip().split()
+
+        # Compute the edit distance between the word lists
+        distance = editdistance.eval(hyp_words, ref_words)
+
+        # Calculate WER
+        wer += distance / len(ref_words) if ref_words else float('inf')
+
+    return wer / len(references)
+
+
+class LossMetric(ModelMetric):
+    def __init__(self, name="loss", memory=100):
+        # Call base class init
+        super().__init__()
+        self.name = name
+        self.memory = memory
+        self.loss = None
+
+
+    def update(self, step, loss, logits, labels, **kwargs):
+        if  self.loss:
+            self.loss = loss * (1 / self.memory) + (1 - 1 / self.memory) * self.loss
+        else:
+            self.loss = loss
+        return self.loss
+
+
+    def get_name(self):
+        return self.name
+
+    def get_value(self):
+        return self.loss
+
+    def new_val_better(self, old_val, new_val):
+        return new_val < old_val
+
+
+class WERMetric(ModelMetric):
+    def __init__(self, tokenizer, name="wer", memory=100):
+        super().__init__()
+        self.name = name
+        self.memory = memory
+        self.wer = None
+        self.tokenizer = tokenizer
+
+
+    def update(self, step, loss, logits, labels, **kwargs):
+
+        ref = self.tokenizer.decode(labels)
+        hyp = self.tokenizer.decode(logits, from_logits=True, ctc=True)
+        wer = calculate_wer(ref, hyp)
+
+        if self.wer:
+            self.wer = wer * (1 / self.memory) + (1 - 1 / self.memory) * self.wer
+        else:
+            self.wer = wer
+        return self.wer
+
+
+    def get_name(self):
+        return self.name
+
+
+    def get_value(self):
+        return self.wer
+
+
+    def new_val_better(self, old_val, new_val):
+        return new_val < old_val
+
+
+class MetricRecorder:
+    def __init__(self):
+        self.metrics = []
+        self.step = -1
+
+    def register_metric(self, metric: ModelMetric):
+        self.metrics.append(metric)
+
+    def update(self, step, loss, preds, labels):
+        results = {}
+        for metric in self.metrics:
+            value = metric.update(step, loss, preds, labels)
+            results[metric.get_name()] = value
+        return results
+
+
+class Checkpointer:
+    def __init__(self, metric: ModelMetric, path: str):
+        self.path = path
+        self.metric = metric
+        self.best_val = None
+
+    def try_save():
+        pass
 
 
 @dataclass
@@ -78,8 +221,59 @@ class CharTokenizer:
         return indices
 
 
-    def decode(self, t):
-        raise NotImplementedError
+    def decode(self, t: torch.Tensor, from_logits: bool = False, ctc: bool = False):
+        """
+        Decodes a batch of sequences of indices into a list of strings,
+        applying CTC decoding rules (removing blanks and merging repeating characters).
+        
+        Args:
+            t (Tensor): Tensor of shape [B, T], where each element is an index.
+        
+        Returns:
+            List[str]: A list of decoded strings of length B.
+        """
+        # Map indices to characters
+        index_to_char = self.reverse_vocab
+
+        blank_index = self.get_blank_index()
+        eos_index = self.get_eos_index()
+        sos_index = self.get_sos_index()
+
+        batch_size = t.size(0)
+        decoded_strings = []
+
+        if from_logits:
+            t = torch.argmax(t, dim=-1)
+
+        for b in range(batch_size):
+            sequence = t[b]
+            decoded_str = []
+            previous_char = None
+
+            for idx in sequence:
+                idx = idx.item()  # Get the integer value from the tensor element
+
+                char = index_to_char.get(idx, '')
+
+                # Stop decoding if EOS token is reached
+                if idx == eos_index:
+                    break
+
+                # Skip blanks and SOS tokens
+                if idx == blank_index or idx == sos_index:
+                    previous_char = char
+                    continue
+
+                # Skip if the same as previous character, and this is ctc
+                if char == previous_char and ctc:
+                    continue
+
+                decoded_str.append(char)
+                previous_char = char
+
+            decoded_strings.append(''.join(decoded_str))
+
+        return decoded_strings
 
 
     def size(self):
@@ -150,7 +344,11 @@ class Dataset(torch.utils.data.Dataset):
         with open(transcript_file, 'r') as f:
             transcript = f.read()
         tokens = self.tokenizer.encode(transcript)
-        return audio, tokens, tokens.shape[0] + 1 # the +1 is to account for the <EOS> token
+        return audio, tokens, tokens.shape[0]
+
+
+    def get_tokenizer(self):
+        return self.tokenizer
 
 
     def get_vocab_size(self):
@@ -204,7 +402,7 @@ class MixerMambaConfig:
     encoder_layers: int = field(default=12)
 
 
-class mambaModel(nn.Module):
+class MambaModel(nn.Module):
 
     def __init__(self, config, vocab_size):
         """
@@ -212,7 +410,7 @@ class mambaModel(nn.Module):
         output: None
         Description: This function initializes the model with the given configuration
         """
-        super(mambaModel, self).__init__()
+        super(MambaModel, self).__init__()
         self.cfg = config
         self.feature_extractor = ConvFeatureExtractionModel(
             conv_layers=eval(self.cfg.conv_feature_enc),
@@ -240,28 +438,47 @@ class mambaModel(nn.Module):
         return self.encoder(features)
 
 
-def main() :
+def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_file = "/workspace/fairseq/data/small_database.csv"
+    dataset_file = "/workspace/fairseq/data/database.csv"
 
     # read the yaml file inside ./../config/s2t.yaml
     cfg = yaml.safe_load(open("./../config/s2t.yaml"))
 
     dataset = Dataset(**cfg["dataset"], device=device)
+    tokenizer = dataset.get_tokenizer()
     loader = torch.utils.data.DataLoader(dataset, batch_size=cfg["dataset"]["batch_size"], shuffle=True, collate_fn=collate_fn, num_workers=cfg["dataset"]["num_workers"])
+
+    # Instantiate the metrics, and register them
+    metric_recorder = MetricRecorder()
+    metric_recorder.register_metric(LossMetric())
+    metric_recorder.register_metric(WERMetric(tokenizer))
 
     mixer_mamba_cfg = MixerMambaConfig(**cfg["model"])
 
-    model = mambaModel(mixer_mamba_cfg, dataset.get_vocab_size()).to(device)
+    model = MambaModel(mixer_mamba_cfg, dataset.get_vocab_size()).to(device)
+    if os.path.exists("best_model.pth"):
+        print("Loading the model.")
+        model.load_state_dict(torch.load("best_model.pth"))
+        print("Model loaded successfully.")
+
+    # Print the model size
+    print(f"Model size: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     optimizer = getattr(torch.optim, cfg["optimizer"]["name"])(model.parameters(), **cfg["optimizer"]["params"])
     criterion = getattr(nn, cfg["criterion"]["name"])(**cfg["criterion"]["params"])
 
-    for epoch in range(10):
+    update_freq = cfg["optimization"]["update_freq"]
+
+    best_loss = None
+
+
+    for epoch in range(50):
         print(f"Epoch {epoch}")
-        epoch_loss = 0
 
         progress_bar = tqdm(loader)
+
+        optimizer.zero_grad()
 
         for step, (audios, tokens, token_lens) in enumerate(progress_bar):
             # the model output have no softmax applied to it.
@@ -271,21 +488,39 @@ def main() :
             # Calculate loss
             input_lens = torch.full((log_probs.shape[0],), log_probs.shape[1], device=log_probs.device, dtype=torch.long)
             log_probs = rearrange(log_probs, 'b t v -> t b v')
-            loss = criterion(log_probs, tokens, input_lens, token_lens)
+            loss = criterion(log_probs, tokens, input_lens, token_lens) / update_freq
 
-            epoch_loss += loss.item()
-
-            # Zero out the gradient state of the model parameters.
-            optimizer.zero_grad()
 
             # Perform a backprop to calculate the new gradients
             loss.backward()
 
-            # Perform an optimizer step
-            optimizer.step()
+            # Update and calculate the metrics
+            metrics = metric_recorder.update(step, loss.item(), logits, tokens)
 
-            progress_bar.set_postfix(loss=(epoch_loss / (step + 1)))
+            if (step + 1) % update_freq == 0:
+                # Perform an optimizer step
+                optimizer.step()
+
+                # Zero out the gradient state of the model parameters.
+                optimizer.zero_grad()
+
+                # TODO:  This is temporary and should change
+                if not best_loss:
+                    best_loss = metrics["loss"]
+                    # save the model
+                    torch.save(model.state_dict(), "tmp.pth")
+                    os.system("cp tmp.pth best_model.pth")
+                elif best_loss > metrics["loss"]:
+                    best_loss = metrics["loss"]
+                    torch.save(model.state_dict(), "tmp.pth")
+                    os.system("cp tmp.pth best_model.pth")
+
+            progress_bar.set_postfix(**metrics)
+
+            if step % cfg["generation"]["freq"] == 0:
+                print(tokenizer.decode(logits, from_logits=True, ctc=True))
 
 
 if __name__ == '__main__':
     main()
+

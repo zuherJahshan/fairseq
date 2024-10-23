@@ -24,8 +24,8 @@ task:
 dataset:
   num_workers: 6
   #max_tokens: 3800000
-  batch_size: 2
-  database_file: "/workspace/fairseq/data/small_database.csv"
+  batch_size: 8
+  database_file: "/workspace/fairseq/data/database.csv"
   vocab_file: "/workspace/fairseq/data/vocab.csv" 
   skip_invalid_size_inputs_valid_test: true
   validate_interval: 5
@@ -42,10 +42,12 @@ criterion:
     blank: 481
 
 optimization:
-  update_freq:
-    - 16
+  update_freq: 16
   max_update: 400000
   lr: [0.0005]
+
+generation:
+  freq: 100
 
 optimizer:
   name: Adam
@@ -53,7 +55,7 @@ optimizer:
     lr: 0.0005
     betas: [0.9,0.98]
     eps: !!float 1e-06
-    weight_decay: 0.01
+    weight_decay: 0.0001
 
 lr_scheduler:
   _name: tri_stage
