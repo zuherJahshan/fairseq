@@ -79,6 +79,10 @@ def calculate_wer(references, queries):
         # Calculate WER
         wer += distance / len(ref_words) if ref_words else float('inf')
 
+        # Raise an exception if the length of the ref_words is zero
+        if not ref_words:
+            print("Reference words are empty")
+
     return wer / len(references)
 
 
@@ -120,7 +124,7 @@ class WERMetric(ModelMetric):
 
     def update(self, step, loss, logits, labels, **kwargs):
 
-        ref = self.tokenizer.decode(labels)
+        ref = labels
         hyp = self.tokenizer.decode(logits, from_logits=True, ctc=True)
         wer = calculate_wer(ref, hyp)
 
@@ -212,9 +216,8 @@ class CharTokenizer:
         Returns:
             Tensor of shape [str_len, vocab_size]
         """
-        vocab_size = self.size()
-        
-        indices = torch.tensor([self.vocab[SpecialTokens.SOS.value]] + [self.vocab[char] for char in t] + [self.vocab[SpecialTokens.EOS.value]], device=self.device)
+
+        indices = torch.tensor([self.vocab[SpecialTokens.SOS.value]] + [self.vocab.get(char, self.vocab[SpecialTokens.BLANK.value]) for char in t] + [self.vocab[SpecialTokens.EOS.value]], device=self.device)
 
         # Convert to one-hot and return
         #return F.one_hot(indices, num_classes=vocab_size)
@@ -225,10 +228,10 @@ class CharTokenizer:
         """
         Decodes a batch of sequences of indices into a list of strings,
         applying CTC decoding rules (removing blanks and merging repeating characters).
-        
+
         Args:
             t (Tensor): Tensor of shape [B, T], where each element is an index.
-        
+
         Returns:
             List[str]: A list of decoded strings of length B.
         """
@@ -329,7 +332,7 @@ class Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         audiofile, transcript_file = self.file_dataset[idx]
-        
+
         # Load the audiofile
         audio, sample_rate = torchaudio.load(audiofile)
 
@@ -344,7 +347,8 @@ class Dataset(torch.utils.data.Dataset):
         with open(transcript_file, 'r') as f:
             transcript = f.read()
         tokens = self.tokenizer.encode(transcript)
-        return audio, tokens, tokens.shape[0]
+
+        return audio, tokens, tokens.shape[0], transcript
 
 
     def get_tokenizer(self):
@@ -368,27 +372,20 @@ class Dataset(torch.utils.data.Dataset):
 
 
 def collate_fn(batch):
-    audios, tokens, lengths = zip(*batch)
-    max_length = max(lengths)
+    audios, tokens, lengths, transcripts = zip(*batch)
 
-    # the tokens is a list of tensors of shape [T, vocab_size] where the last dimension is always the same for all
-    # tensors and is equal to vocab_size. And the [0] dimension is the length of the transcript.
-    # Pad the tokens to have the same length and stack them to form [B,T, vocab_size]
-    #padded_tokens = torch.stack([F.pad(token, (0, 0, 0, max_length - token.size(0))) for token in tokens])
+    # collate only audios, tokens and lengths that have length > 0
+    audios = [audio for idx, audio in enumerate(audios) if lengths[idx] > 0]
+    tokens = [token for idx, token in enumerate(tokens) if lengths[idx] > 0]
+    lengths = [length for length in lengths if length > 0]
 
-    padded_tokens = []
-    for token in tokens:
-        padding = torch.ones((max_length - token.shape[0]), device=token.device) * 482 # TODO:  should be changed
-        padded_tokens.append(torch.cat((token, padding), dim=0))
-
-    padded_tokens = torch.stack(padded_tokens)
-
-
-    token_lens = torch.tensor(lengths, device=padded_tokens.device, dtype=torch.long)
+    # Concatenate the tokens and create target lengths
+    targets = torch.cat(tokens)
+    target_lens = torch.tensor(lengths, dtype=torch.long, device=targets.device)
 
     # audios have a shape of (audio_length), we need to build a tensor of shape (batch_size, audio_length)
     audios = torch.stack(audios)
-    return audios, padded_tokens, token_lens
+    return audios, targets, target_lens, transcripts
 
 
 @dataclass
@@ -480,9 +477,12 @@ def main():
 
         optimizer.zero_grad()
 
-        for step, (audios, tokens, token_lens) in enumerate(progress_bar):
+        for step, (audios, tokens, token_lens, transcripts) in enumerate(progress_bar):
             # the model output have no softmax applied to it.
             logits, _ = model(audios)
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print("Logits are NaN")
+                continue
             log_probs = F.log_softmax(logits, dim=-1)
 
             # Calculate loss
@@ -490,14 +490,19 @@ def main():
             log_probs = rearrange(log_probs, 'b t v -> t b v')
             loss = criterion(log_probs, tokens, input_lens, token_lens) / update_freq
 
-
             # Perform a backprop to calculate the new gradients
+            if torch.isnan(loss):
+                print("Loss is NaN")
+                continue
             loss.backward()
 
             # Update and calculate the metrics
-            metrics = metric_recorder.update(step, loss.item(), logits, tokens)
+            metrics = metric_recorder.update(step, loss.item(), logits, transcripts)
 
             if (step + 1) % update_freq == 0:
+                # Clip the gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
                 # Perform an optimizer step
                 optimizer.step()
 
