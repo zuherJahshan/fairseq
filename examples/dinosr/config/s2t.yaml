@@ -44,7 +44,9 @@ criterion:
 
 optimization:
   update_freq: 16
+  warmup_steps: 4000
   max_update: 400000
+  init_step: 0
   lr: [0.0005]
 
 generation:
@@ -53,10 +55,10 @@ generation:
 optimizer:
   name: Adam
   params:
-    lr: 0.00005
+    lr: 0.0005
     betas: [0.9,0.98]
     eps: !!float 1e-06
-    weight_decay: 0.0001
+    weight_decay: 0.01
 
 lr_scheduler:
   _name: tri_stage
@@ -66,7 +68,10 @@ model:
   extractor_mode: layer_norm
   encoder_embed_dim: 768
   fe_dropout: 0.0
-  encoder_layers: 4
+  encoder_layers: 12
+  top_k_layers: 8
+  codebook_size: 256
+  ema_decay: 0.999
 
   conv_feature_enc: "[(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512,2,2)] + [(512,2,2)]"
   vocab_file: "/workspace/fairseq/data/vocab.csv"

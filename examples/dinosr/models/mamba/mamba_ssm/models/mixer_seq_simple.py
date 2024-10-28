@@ -198,7 +198,7 @@ class MixerModel(nn.Module):
                 hidden_states, residual, inference_params=inference_params, **mixer_kwargs
             )
             if idx >= min_layer and idx < len(self.layers) - 1:
-                layer_results.append([[], [], rearrange(hidden_states, 'b t d -> t b d')])
+                layer_results.append(hidden_states)
         if not self.fused_add_norm:
             residual = (hidden_states + residual) if residual is not None else hidden_states
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
@@ -214,7 +214,7 @@ class MixerModel(nn.Module):
                 residual_in_fp32=self.residual_in_fp32,
                 is_rms_norm=isinstance(self.norm_f, RMSNorm)
             )
-        layer_results.append([[],[], rearrange(hidden_states, 'b t d -> t b d')])
+        layer_results.append(hidden_states)
         return hidden_states, layer_results
 
 

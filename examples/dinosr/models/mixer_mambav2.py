@@ -1,4 +1,5 @@
 from multiprocessing import set_start_method
+
 # Set the start method to spawn
 try:
     set_start_method('spawn')
@@ -12,6 +13,8 @@ from tqdm import tqdm
 import whisper
 import torchaudio
 import csv
+from fairseq.modules import EMAModule, EMAModuleConfig
+from fairseq.data.data_utils import compute_mask_indices
 from fairseq.models.wav2vec import ConvFeatureExtractionModel
 import yaml
 from dataclasses import (
@@ -25,7 +28,6 @@ import string
 import editdistance
 from abc import ABC, abstractmethod
 import os
-
 
 class ModelMetric(ABC):
     def __init__(self, **kwargs):
@@ -399,10 +401,221 @@ class MixerMambaConfig:
     vocab_file: str = field(default="/workspace/fairseq/data/vocab.csv")
     fe_dropout: float = field(default=0.0)
     encoder_layers: int = field(default=12)
+    mask_prob: int = field(default=0.5)
+    mask_length: int = field(default=10)
+    top_k_layers: int = field(default=8)
+    codebook_size: int = field(default=256)
+    n_codebooks: int = field(default=8)
+    codebook_init_decay: float = field(default=0.9) # TODO: set it up correctly
+    ema_decay: float = field(default=0.999) # TODO: set it up correctly
+
+
+class DinoSRModel(nn.Module):
+    def __init__(self, cfg: MixerMambaConfig, student: nn.Module):
+        super(DinoSRModel, self).__init__()
+        self.cfg = cfg
+
+        self.student = student
+
+        self.mask_prob = cfg.mask_prob
+        self.mask_length = cfg.mask_length
+        self.mask_emb = nn.Parameter(torch.randn(cfg.encoder_embed_dim))
+
+        self.codebook_size = cfg.codebook_size
+        self.n_codebooks = cfg.n_codebooks
+        self.codebook_decay = cfg.codebook_init_decay
+        self.heads = torch.nn.ModuleList([
+            nn.Linear(
+                cfg.encoder_embed_dim,
+                self.codebook_size
+            ) for _ in range(self.n_codebooks)
+        ])
+        self.ema_decay = cfg.ema_decay
+
+        codebooks = torch.randn(self.n_codebooks, cfg.encoder_embed_dim, self.codebook_size)
+        codebooks = F.instance_norm(codebooks).transpose(1, 2)
+        self.codebooks = {
+            i: codebooks[i] for i in range(self.n_codebooks)
+        }
+        self.codebook_cnts = {
+            i: torch.ones(self.codebook_size) for i in range(self.n_codebooks)
+        }
+
+        ema_cfg = EMAModuleConfig(
+            ema_decay=self.ema_decay,
+            ema_fp32=True,
+        )
+        self.teacher = EMAModule(student, ema_cfg)
+
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        # Get the state_dict from the superclass
+        state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+        
+        # Remove the student model's state_dict to avoid duplication
+        student_keys = [key for key in state.keys() if key.startswith(prefix + 'student.')]
+        for key in student_keys:
+            del state[key]
+        
+        # Save codebooks and codebook counts
+        for i in self.codebooks:
+            state[prefix + f'codebooks.{i}'] = self.codebooks[i]
+            state[prefix + f'codebook_cnts.{i}'] = self.codebook_cnts[i]
+        
+        # Save the mask embedding
+        state[prefix + 'mask_emb'] = self.mask_emb
+
+        # Save the teacher model's state_dict with a prefix
+        teacher_state = self.teacher.model.state_dict(destination=destination, prefix=prefix + 'teacher_model.', keep_vars=keep_vars)
+        if self.teacher.config.ema_fp32:
+            for key in self.teacher.fp32_params:
+                teacher_state[prefix + f'teacher_fp32_params.{key}'] = self.teacher.fp32_params[key]
+        state.update(teacher_state)
+
+        return state
+
+
+    def load_state_dict(self, state_dict, strict=True):
+        # Load codebooks and codebook counts
+        for i in self.codebooks:
+            self.codebooks[i] = state_dict.pop(f'codebooks.{i}')
+            self.codebook_cnts[i] = state_dict.pop(f'codebook_cnts.{i}')
+
+        # Load the mask embedding
+        self.mask_emb.data.copy_(state_dict.pop('mask_emb'))
+
+        # Load the teacher model's state_dict
+        teacher_model_state_dict = {
+            k.replace('teacher_model.', ''): v
+            for k, v in state_dict.items()
+            if k.startswith('teacher_model.')
+        }
+        self.teacher.model.load_state_dict(teacher_model_state_dict, strict=strict)
+
+        # Remove teacher model entries from state_dict
+        for key in list(state_dict.keys()):
+            if key.startswith('teacher_model.'):
+                del state_dict[key]
+
+        # Load teacher's fp32_params if ema_fp32 is True
+        if self.teacher.config.ema_fp32:
+            self.teacher.fp32_params = {}
+            fp32_keys = [k for k in state_dict.keys() if k.startswith('teacher_fp32_params.')]
+            for key in fp32_keys:
+                param_name = key.replace('teacher_fp32_params.', '')
+                self.teacher.fp32_params[param_name] = state_dict.pop(key)
+        
+        # Remove any remaining teacher_fp32_params entries from state_dict
+        for key in list(state_dict.keys()):
+            if key.startswith('teacher_fp32_params.'):
+                del state_dict[key]
+
+        # Remove student keys from state_dict to prevent duplication
+        student_keys = [key for key in state_dict.keys() if key.startswith('student.')]
+        for key in student_keys:
+            del state_dict[key]
+
+        # Call the superclass's load_state_dict to load remaining parameters
+        super().load_state_dict(state_dict, strict=False)
+
+
+    def ema_step(self):
+        self.teacher.step(self.student)
+
+
+    def to(self, device, *args, **kwargs):
+        self.codebooks = {
+            i: codebook.to(device) for i, codebook in self.codebooks.items()
+        }
+        self.codebook_cnts = {
+            i: codebook_cnt.to(device) for i, codebook_cnt in self.codebook_cnts.items()
+        }
+        # Handle teacher movement
+        self.teacher.model.to(device)
+        if self.teacher.config.ema_fp32:
+            for key in self.teacher.fp32_params:
+                self.teacher.fp32_params[key] = self.teacher.fp32_params[key].to(device)
+
+        return super().to(device, *args, **kwargs)
+
+
+    def forward(self, x):
+        features = x # x are the features after CNN feature extraction was applied to them.
+        B, T, _ = features.shape
+
+        # Copy the features for the teacher before applying the mask
+        pre_encoder_features = features.clone().to(x.device)
+
+        mask_indices = compute_mask_indices(
+            (B,T),
+            padding_mask=None,
+            mask_prob=self.mask_prob,
+            mask_length=self.mask_length,
+        )
+        mask_indices = torch.from_numpy(mask_indices).to(x.device)
+
+        x, layer_results = self.student(x)
+        layer_results = [
+            l[mask_indices] for l in layer_results # Changes the shape from [B,T,D] to [mask(B*T), D]
+        ]
+
+        with torch.no_grad():
+            self.teacher.model.eval()
+
+            # Calculate the teacher features
+            _, target_layer_results = self.teacher.model.extract_features(
+                pre_encoder_features,
+                min_layer=self.cfg.encoder_layers - self.cfg.top_k_layers,
+            )
+
+            # Apply instance normalization to the teacher features
+            target_layer_results = [rearrange(tl, 'b t d -> b d t') for tl in target_layer_results]
+            target_layer_results = [
+                F.instance_norm(tl) for tl in target_layer_results
+            ]
+            target_layer_results = [
+                rearrange(tl, 'b d t -> b t d') for tl in target_layer_results
+            ]
+
+            # Filter out target_layer_results
+            target_layer_results = [
+                tl[mask_indices] for tl in target_layer_results # Changes the shapr from [B,T,D] to [mask(B*T), D]
+            ]
+
+            x = x[mask_indices]
+
+        losses = 0.0
+        for i, (target, lr) in enumerate(zip(target_layer_results, layer_results)):
+            with torch.no_grad():
+                codebook = self.codebooks[i] / self.codebook_cnts[i].unsqueeze(1)
+
+                # Calculate teacher preds distance from codebook words. The total shape of neg_l2_dist is [B*T, CS]
+                neg_l2_dist = - (torch.sum(target**2, dim=1, keepdim=True) # shape [B*T, 1]
+                                + torch.sum(codebook**2, dim=1) # shape [CS]
+                                - 2 * torch.matmul(target, codebook.t()))
+
+                # Create onehot targets according to the maximum negative l2 distance
+                onehot_target = torch.zeros_like(neg_l2_dist)
+                onehot_target[range(len(neg_l2_dist)), neg_l2_dist.argmax(dim=1)] = 1.0
+
+            # Calculate loss
+            pred = self.heads[i](lr)
+            pred = F.log_softmax(pred, dim=-1)
+            loss = torch.sum(-onehot_target*pred, dim=-1)
+            losses += losses + loss
+
+            # Update codebook
+            count = onehot_target.sum(0)
+            memory = torch.matmul(onehot_target.t(), target)
+            alpha = torch.ones_like(count).unsqueeze(1)
+            alpha[count!=0] = self.codebook_decay
+            self.codebook_cnts[i] = alpha.squeeze(1) * self.codebook_cnts[i] + (1-alpha).squeeze(1) * count
+            self.codebooks[i] = alpha * self.codebooks[i] + (1-alpha) * memory
+
+        return (losses / self.n_codebooks).sum()
 
 
 class MambaModel(nn.Module):
-
     def __init__(self, config, vocab_size):
         """
         input: config - a yaml file defining the configuration of the model
@@ -423,6 +636,51 @@ class MambaModel(nn.Module):
         mamba_cfg.vocab_size = vocab_size
         mamba_cfg.n_layer = self.cfg.encoder_layers
         self.encoder = MambaLMHeadModel(mamba_cfg)
+        self.dinosr = DinoSRModel(config, self.encoder)
+
+
+    def run_dinosr(self, audios):
+        features = self.feature_extractor(audios)
+        features = rearrange(features, 'b d t -> b t d')
+        return self.dinosr(features)
+
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        # Get the state_dict from the superclass
+        state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+        # Remove the student model's state_dict from dinosr to avoid duplication
+        dinosr_state = self.dinosr.state_dict(destination=destination, prefix=prefix + 'dinosr.', keep_vars=keep_vars)
+        state.update(dinosr_state)
+
+        return state
+
+
+    def load_state_dict(self, state_dict, strict=True):
+        # Load the dinosr state dict
+        dinosr_keys = [k for k in state_dict.keys() if k.startswith('dinosr.')]
+        dinosr_state_dict = {k.replace('dinosr.', ''): state_dict[k] for k in dinosr_keys}
+        self.dinosr.load_state_dict(dinosr_state_dict, strict=strict)
+
+        # Remove dinosr entries from state_dict
+        for key in dinosr_keys:
+            del state_dict[key]
+
+        # Ensure that self.encoder and self.dinosr.student share parameters
+        self.dinosr.student = self.encoder
+
+        # Call the superclass's load_state_dict to load remaining parameters
+        super().load_state_dict(state_dict, strict=False)
+
+
+    def ema_step(self):
+        self.dinosr.ema_step()
+
+
+    def to(self, device, *args, **kwargs):
+        self.dinosr.to(device)
+        return super().to(device, *args, **kwargs)
+
 
     def forward(self, audios):
         """
@@ -435,6 +693,14 @@ class MambaModel(nn.Module):
 
         # features have a shape of (batch_size, feature_length, feature_dim)
         return self.encoder(features)
+
+
+def lr_lambda(current_step, warmup_steps, init_step=0):
+    current_step = max(1, current_step+init_step)
+    if current_step < warmup_steps:
+        return current_step / warmup_steps
+    else:
+        return (warmup_steps ** 0.5) / (current_step ** 0.5)
 
 
 def main():
@@ -465,6 +731,7 @@ def main():
     print(f"Model size: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     optimizer = getattr(torch.optim, cfg["optimizer"]["name"])(model.parameters(), **cfg["optimizer"]["params"])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: lr_lambda(step, cfg["optimization"]["warmup_steps"], cfg["optimization"]["init_step"]))
     criterion = getattr(nn, cfg["criterion"]["name"])(**cfg["criterion"]["params"])
 
     update_freq = cfg["optimization"]["update_freq"]
@@ -482,6 +749,7 @@ def main():
         for step, (audios, tokens, token_lens, transcripts) in enumerate(progress_bar):
             # the model output have no softmax applied to it.
             logits, _ = model(audios)
+            dinosr_loss = model.run_dinosr(audios) / update_freq
             if torch.isnan(logits).any() or torch.isinf(logits).any():
                 print("Logits are NaN")
                 continue
@@ -490,7 +758,7 @@ def main():
             # Calculate loss
             input_lens = torch.full((log_probs.shape[0],), log_probs.shape[1], device=log_probs.device, dtype=torch.long)
             log_probs = rearrange(log_probs, 'b t v -> t b v')
-            loss = criterion(log_probs, tokens, input_lens, token_lens) / update_freq
+            loss = criterion(log_probs, tokens, input_lens, token_lens) / update_freq + dinosr_loss * 0.0001
 
             # Perform a backprop to calculate the new gradients
             if torch.isnan(loss):
@@ -507,6 +775,8 @@ def main():
 
                 # Perform an optimizer step
                 optimizer.step()
+                model.ema_step()
+                scheduler.step()
 
                 # Zero out the gradient state of the model parameters.
                 optimizer.zero_grad()

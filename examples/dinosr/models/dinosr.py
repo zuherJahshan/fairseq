@@ -126,8 +126,6 @@ class DinosrModel(BaseFairseqModel):
         self.discrete = cfg.discrete
 
         feature_enc_layers = eval(cfg.conv_feature_layers)
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        print(f"feature_enc_layers: {cfg.conv_feature_layers}")
         self.extractor_embed = feature_enc_layers[-1][0]
 
         self.ema = None
@@ -142,14 +140,14 @@ class DinosrModel(BaseFairseqModel):
             dropout=0.0,
             mode=cfg.extractor_mode,
             conv_bias=cfg.conv_bias,
-        )
+        ) #Done
 
-        self.post_extract_proj = nn.Linear(self.extractor_embed, cfg.encoder_embed_dim)
+        self.post_extract_proj = nn.Linear(self.extractor_embed, cfg.encoder_embed_dim) # Inside Mamba
 
-        self.mask_prob = cfg.mask_prob
+        self.mask_prob = cfg.mask_prob #Done
         self.mask_selection = cfg.mask_selection
         self.mask_other = cfg.mask_other
-        self.mask_length = cfg.mask_length
+        self.mask_length = cfg.mask_length #Done
         self.no_mask_overlap = cfg.no_mask_overlap
         self.mask_min_space = cfg.mask_min_space
 
@@ -224,7 +222,7 @@ class DinosrModel(BaseFairseqModel):
             ema_config,
             skip_keys=skip_keys,
         )
-    
+
     def move_codebook_to_gpu(self):
         # Move codebook to GPU
         device = next(self.encoder.parameters()).device
@@ -234,7 +232,7 @@ class DinosrModel(BaseFairseqModel):
         self.codebook_cnts = {
             i:self.codebook_cnts[i].to(device) for i in range(self.n_codebooks)
         }
-    
+
     def freeze_shared_modules(self):
         # Hack to avoid updating any of the shared modules (e.g., Weight Decay from optimizer)
         # using WD=0 + torch.no_grad() for following modules will still result in higher loss somehow
