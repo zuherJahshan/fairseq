@@ -695,12 +695,15 @@ class MambaModel(nn.Module):
         return self.encoder(features)
 
 
-def lr_lambda(current_step, warmup_steps, init_step=0):
+def lr_lambda(current_step, warmup_steps, saturation_steps, init_step=0):
     current_step = max(1, current_step+init_step)
+    steps_until_decay = warmup_steps + saturation_steps
     if current_step < warmup_steps:
         return current_step / warmup_steps
+    elif current_step < steps_until_decay:
+        return 1.0
     else:
-        return (warmup_steps ** 0.5) / (current_step ** 0.5)
+        return (steps_until_decay ** 0.5) / (current_step ** 0.5)
 
 
 def main():
@@ -738,6 +741,7 @@ def main():
 
     best_loss = None
 
+    run_dinosr = cfg["optimization"]["run_dinosr"]
 
     for epoch in range(50):
         print(f"Epoch {epoch}")
@@ -749,7 +753,8 @@ def main():
         for step, (audios, tokens, token_lens, transcripts) in enumerate(progress_bar):
             # the model output have no softmax applied to it.
             logits, _ = model(audios)
-            dinosr_loss = model.run_dinosr(audios) / update_freq
+            if run_dinosr:
+                dinosr_loss = model.run_dinosr(audios) / update_freq
             if torch.isnan(logits).any() or torch.isinf(logits).any():
                 print("Logits are NaN")
                 continue
@@ -758,7 +763,9 @@ def main():
             # Calculate loss
             input_lens = torch.full((log_probs.shape[0],), log_probs.shape[1], device=log_probs.device, dtype=torch.long)
             log_probs = rearrange(log_probs, 'b t v -> t b v')
-            loss = criterion(log_probs, tokens, input_lens, token_lens) / update_freq + dinosr_loss * 0.0001
+            loss = criterion(log_probs, tokens, input_lens, token_lens) / update_freq
+            if run_dinosr:
+                loss += dinosr_loss * cfg["optimization"]["dinosr_lambda"]
 
             # Perform a backprop to calculate the new gradients
             if torch.isnan(loss):
@@ -775,7 +782,8 @@ def main():
 
                 # Perform an optimizer step
                 optimizer.step()
-                model.ema_step()
+                if run_dinosr:
+                    model.ema_step()
                 scheduler.step()
 
                 # Zero out the gradient state of the model parameters.

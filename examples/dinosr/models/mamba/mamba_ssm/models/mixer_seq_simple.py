@@ -124,6 +124,7 @@ class MixerModel(nn.Module):
         n_layer: int,
         d_intermediate: int,
         vocab_size: int,
+        model_mode: str = "projection",
         ssm_cfg=None,
         attn_layer_idx=None,
         attn_cfg=None,
@@ -139,7 +140,11 @@ class MixerModel(nn.Module):
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
 
-        self.embedding = nn.Linear(in_features, d_model, **factory_kwargs)
+        if model_mode == "projection":
+            self.embedding = nn.Linear(in_features, d_model, **factory_kwargs)
+        else:
+            assert in_features == vocab_size, "Embedding mode only supports vocab_size == in_features"
+            self.embedding = nn.Embeding(vocab_size, d_model, **factory_kwargs)
 
         # We change the order of residual and layer norm:
         # Instead of LN -> Attn / MLP -> Add, we do:

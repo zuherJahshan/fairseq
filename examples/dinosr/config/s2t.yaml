@@ -44,10 +44,12 @@ criterion:
 
 optimization:
   update_freq: 16
-  warmup_steps: 4000
+  warmup_steps: 40000
+  saturation_steps: 1_000_000
   max_update: 400000
   init_step: 0
-  lr: [0.0005]
+  run_dinosr: true
+  dinosr_lambda:  !!float 0.1
 
 generation:
   freq: 100
@@ -66,10 +68,10 @@ lr_scheduler:
 
 model:
   extractor_mode: layer_norm
-  encoder_embed_dim: 768
+  encoder_embed_dim: 1024
   fe_dropout: 0.0
-  encoder_layers: 12
-  top_k_layers: 8
+  encoder_layers: 6
+  top_k_layers: 4
   codebook_size: 256
   ema_decay: 0.999
 
