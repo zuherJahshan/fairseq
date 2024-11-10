@@ -34,7 +34,7 @@ class ModelMetric(ABC):
         pass
 
     @abstractmethod
-    def update(self, step, loss, logits, labels, **kwargs):
+    def update(self, **kwargs):
         pass
 
     @abstractmethod
@@ -99,7 +99,10 @@ class LossMetric(ModelMetric):
         self.loss = None
 
 
-    def update(self, step, loss, logits, labels, **kwargs):
+    def update(self, step, **kwargs):
+        loss = kwargs.get(self.name, None)
+        if loss is None:
+            raise ValueError(f"Loss value not found in kwargs for metric {self.name}")
         if  self.loss:
             self.loss = loss * (1 / self.memory) + (1 - 1 / self.memory) * self.loss
         else:
@@ -126,7 +129,7 @@ class WERMetric(ModelMetric):
         self.tokenizer = tokenizer
 
 
-    def update(self, step, loss, logits, labels, **kwargs):
+    def update(self, step, logits, labels, **kwargs):
 
         ref = labels
         hyp = self.tokenizer.decode(logits, from_logits=True, ctc=True)
@@ -159,10 +162,10 @@ class MetricRecorder:
     def register_metric(self, metric: ModelMetric):
         self.metrics.append(metric)
 
-    def update(self, step, loss, preds, labels):
+    def update(self, step, **kwargs):
         results = {}
         for metric in self.metrics:
-            value = metric.update(step, loss, preds, labels)
+            value = metric.update(step, **kwargs)
             results[metric.get_name()] = value
         return results
 
@@ -342,7 +345,7 @@ class Dataset(torch.utils.data.Dataset):
 
         # Resample the audio if necessary
         if sample_rate != self.target_sample_rate:
-            resampler = Resample(orig_freq=sample_rate, new_freq=self.target_sample_rate)
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=self.target_sample_rate)
             audio = resampler(audio)
 
         audio = whisper.pad_or_trim(audio.flatten()).to(self.device)
@@ -721,20 +724,43 @@ def main():
     metric_recorder = MetricRecorder()
     metric_recorder.register_metric(LossMetric())
     metric_recorder.register_metric(WERMetric(tokenizer))
+    metric_recorder.register_metric(LossMetric(name="dinosr_loss"))
+    metric_recorder.register_metric(LossMetric(name="mse_loss"))
+    metric_recorder.register_metric(LossMetric(name="asr_loss"))
 
     mixer_mamba_cfg = MixerMambaConfig(**cfg["model"])
+    len_model_cfg = MixerMambaConfig(**cfg["len_model"])
 
     model = MambaModel(mixer_mamba_cfg, dataset.get_vocab_size()).to(device)
+    len_model = MambaModel(len_model_cfg, 1).to(device)
+
     if os.path.exists("best_model.pth"):
         print("Loading the model.")
         model.load_state_dict(torch.load("best_model.pth"))
         print("Model loaded successfully.")
 
+    if os.path.exists("best_len.pth"):
+        len_model.load_state_dict(torch.load("best_len.pth"))
+
     # Print the model size
     print(f"Model size: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
-    optimizer = getattr(torch.optim, cfg["optimizer"]["name"])(model.parameters(), **cfg["optimizer"]["params"])
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: lr_lambda(step, cfg["optimization"]["warmup_steps"], cfg["optimization"]["init_step"]))
+    optimizer = getattr(torch.optim, cfg["optimizer"]["name"])(
+        model.parameters(),
+        **cfg["optimizer"]["params"]
+    )
+    len_optimizer = getattr(torch.optim, cfg["optimizer"]["name"])(
+        len_model.parameters(),
+        **cfg["optimizer"]["params"]
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: lr_lambda(
+            step,
+            cfg["optimization"]["warmup_steps"],
+            cfg["optimization"]["init_step"]
+        )
+    )
     criterion = getattr(nn, cfg["criterion"]["name"])(**cfg["criterion"]["params"])
 
     update_freq = cfg["optimization"]["update_freq"]
@@ -753,28 +779,47 @@ def main():
         for step, (audios, tokens, token_lens, transcripts) in enumerate(progress_bar):
             # the model output have no softmax applied to it.
             logits, _ = model(audios)
+
+            # run length model
+            len_logits, _ = len_model(audios)
+            predicted_lens = len_logits[:, :, 0].squeeze(-1)
+            mse_loss = F.mse_loss(predicted_lens[:, -1], token_lens.float())
+
+            # Claculate dinosr loss
             if run_dinosr:
                 dinosr_loss = model.run_dinosr(audios) / update_freq
-            if torch.isnan(logits).any() or torch.isinf(logits).any():
-                print("Logits are NaN")
-                continue
             log_probs = F.log_softmax(logits, dim=-1)
 
             # Calculate loss
             input_lens = torch.full((log_probs.shape[0],), log_probs.shape[1], device=log_probs.device, dtype=torch.long)
             log_probs = rearrange(log_probs, 'b t v -> t b v')
-            loss = criterion(log_probs, tokens, input_lens, token_lens) / update_freq
+            asr_loss = criterion(log_probs, tokens, input_lens, token_lens) / update_freq
+
+            # Update and calculate the metrics
+            metrics = metric_recorder.update(
+                step,
+                loss=loss.item(),
+                logits=logits,
+                labels=transcripts,
+                mse_loss=mse_loss.item(),
+                dinosr_loss=dinosr_loss.item(),
+                asr_loss=asr_loss.item())
+
+            loss = asr_loss
+            # Add dinosr loss to the total loss
             if run_dinosr:
                 loss += dinosr_loss * cfg["optimization"]["dinosr_lambda"]
 
             # Perform a backprop to calculate the new gradients
-            if torch.isnan(loss):
+            if torch.isnan(loss) or torch.isinf(loss):
                 print("Loss is NaN")
                 continue
             loss.backward()
 
-            # Update and calculate the metrics
-            metrics = metric_recorder.update(step, loss.item(), logits, transcripts)
+            if torch.isnan(mse_loss) or torch.isinf(mse_loss):
+                print("MSE Loss is NaN")
+                continue
+            mse_loss.backward()
 
             if (step + 1) % update_freq == 0:
                 # Clip the gradients
@@ -782,23 +827,28 @@ def main():
 
                 # Perform an optimizer step
                 optimizer.step()
+                len_optimizer.step()
                 if run_dinosr:
                     model.ema_step()
                 scheduler.step()
 
                 # Zero out the gradient state of the model parameters.
                 optimizer.zero_grad()
+                len_optimizer.zero_grad()
 
                 # TODO:  This is temporary and should change
                 if not best_loss:
                     best_loss = metrics["loss"]
                     # save the model
                     torch.save(model.state_dict(), "tmp.pth")
+                    torch.save(len_model.state_dict(), "tmp_len.pth")
                     os.system("cp tmp.pth best_model.pth")
                 elif best_loss > metrics["loss"]:
                     best_loss = metrics["loss"]
                     torch.save(model.state_dict(), "tmp.pth")
+                    torch.save(len_model.state_dict(), "tmp_len.pth")
                     os.system("cp tmp.pth best_model.pth")
+                    os.system("cp tmp_len.pth best_len.pth")
 
             progress_bar.set_postfix(**metrics)
 

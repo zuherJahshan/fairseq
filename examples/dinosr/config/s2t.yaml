@@ -47,7 +47,7 @@ optimization:
   warmup_steps: 40000
   saturation_steps: 1_000_000
   max_update: 400000
-  init_step: 0
+  init_step: 40_000
   run_dinosr: true
   dinosr_lambda:  !!float 0.1
 
@@ -57,7 +57,7 @@ generation:
 optimizer:
   name: Adam
   params:
-    lr: 0.0005
+    lr: 0.0003
     betas: [0.9,0.98]
     eps: !!float 1e-06
     weight_decay: 0.01
@@ -72,6 +72,16 @@ model:
   fe_dropout: 0.0
   encoder_layers: 6
   top_k_layers: 4
+  codebook_size: 256
+  ema_decay: 0.999
+
+
+len_model:
+  extractor_mode: layer_norm
+  encoder_embed_dim: 256
+  fe_dropout: 0.0
+  encoder_layers: 2
+  top_k_layers: 0
   codebook_size: 256
   ema_decay: 0.999
 
