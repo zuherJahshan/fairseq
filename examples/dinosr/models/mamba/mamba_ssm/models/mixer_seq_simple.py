@@ -248,8 +248,8 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         factory_kwargs = {"device": device, "dtype": dtype}
 
         super().__init__()
-        if vocab_size % pad_vocab_size_multiple != 0:
-            vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
+        #if vocab_size % pad_vocab_size_multiple != 0:
+            #vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
         self.backbone = MixerModel(
             in_features=in_features,
             d_model=d_model,

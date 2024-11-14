@@ -8,7 +8,8 @@ common:
   profile: false
 
 checkpoint:
-  save_interval: 5
+  save_interval: 128
+  best_loss: !!float .inf
   save_interval_updates: 5000
   keep_interval_updates: 1
   no_epoch_checkpoints: true
@@ -37,19 +38,18 @@ distributed_training:
   ddp_backend: legacy_ddp
 
 criterion:
-  name: CTCLoss
+  name: CrossEntropyLoss
   params:
-    blank: 481
-    zero_infinity: true
+    reduction: "mean"
 
 optimization:
   update_freq: 16
-  warmup_steps: 40000
+  warmup_steps: 4_000
   saturation_steps: 1_000_000
   max_update: 400000
-  init_step: 40_000
+  init_step: 900
   run_dinosr: true
-  dinosr_lambda:  !!float 0.1
+  dinosr_lambda:  !!float 0.005
 
 generation:
   freq: 100
@@ -62,6 +62,7 @@ optimizer:
     eps: !!float 1e-06
     weight_decay: 0.01
 
+
 lr_scheduler:
   _name: tri_stage
   phase_ratio: [0.03,0.47,0.50]
@@ -69,21 +70,14 @@ lr_scheduler:
 model:
   extractor_mode: layer_norm
   encoder_embed_dim: 1024
+  decoder_embed_dim: 256
+  decoder_heads: 8
+  decoder_expand: 4
+  decoder_layers: 2
   fe_dropout: 0.0
   encoder_layers: 6
   top_k_layers: 4
   codebook_size: 256
   ema_decay: 0.999
-
-
-len_model:
-  extractor_mode: layer_norm
-  encoder_embed_dim: 256
-  fe_dropout: 0.0
-  encoder_layers: 2
-  top_k_layers: 0
-  codebook_size: 256
-  ema_decay: 0.999
-
   conv_feature_enc: "[(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512,2,2)] + [(512,2,2)]"
   vocab_file: "/workspace/fairseq/data/vocab.csv"

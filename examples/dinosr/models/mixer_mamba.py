@@ -1,4 +1,5 @@
 from multiprocessing import set_start_method
+
 # Set the start method to spawn
 try:
     set_start_method('spawn')
@@ -12,6 +13,8 @@ from tqdm import tqdm
 import whisper
 import torchaudio
 import csv
+from fairseq.modules import EMAModule, EMAModuleConfig
+from fairseq.data.data_utils import compute_mask_indices
 from fairseq.models.wav2vec import ConvFeatureExtractionModel
 import yaml
 from dataclasses import (
@@ -25,6 +28,9 @@ import string
 import editdistance
 from abc import ABC, abstractmethod
 import os
+import string
+from matplotlib import pyplot as plt
+from argparse import ArgumentParser
 
 
 class ModelMetric(ABC):
@@ -32,7 +38,7 @@ class ModelMetric(ABC):
         pass
 
     @abstractmethod
-    def update(self, step, loss, logits, labels, **kwargs):
+    def update(self, **kwargs):
         pass
 
     @abstractmethod
@@ -97,7 +103,10 @@ class LossMetric(ModelMetric):
         self.loss = None
 
 
-    def update(self, step, loss, logits, labels, **kwargs):
+    def update(self, step, **kwargs):
+        loss = kwargs.get(self.name, None)
+        if loss is None:
+            raise ValueError(f"Loss value not found in kwargs for metric {self.name}")
         if  self.loss:
             self.loss = loss * (1 / self.memory) + (1 - 1 / self.memory) * self.loss
         else:
@@ -124,7 +133,7 @@ class WERMetric(ModelMetric):
         self.tokenizer = tokenizer
 
 
-    def update(self, step, loss, logits, labels, **kwargs):
+    def update(self, step, logits, labels, **kwargs):
 
         ref = labels
         hyp = self.tokenizer.decode(logits, from_logits=True, ctc=True)
@@ -149,6 +158,43 @@ class WERMetric(ModelMetric):
         return new_val < old_val
 
 
+class AccuracyMetric(ModelMetric):
+    def __init__(self, name="accuracy", memory=100):
+        super().__init__()
+        self.name = name
+        self.memory = memory
+        self.accuracy = None
+
+
+    def update(self, step, logits, labels, **kwargs):
+        # logits is of shape [B, S, C]
+        # labels is of shape [B, S]
+        # Get the argmax of the logits and compare to the labels, avarage and return the accuracy
+        preds = torch.argmax(logits, dim=-1)
+        correct = torch.sum(preds == labels)
+        total = labels.numel()
+        accuracy = correct / total
+
+        if self.accuracy:
+            self.accuracy = accuracy * (1 / self.memory) + (1 - 1 / self.memory) * self.accuracy
+        else:
+            self.accuracy = accuracy
+
+        return self.accuracy
+
+
+    def get_name(self):
+        return self.name
+
+
+    def get_value(self):
+        return self.accuracy
+
+
+    def new_val_better(self, old_val, new_val):
+        return new_val > old_val
+
+
 class MetricRecorder:
     def __init__(self):
         self.metrics = []
@@ -157,10 +203,10 @@ class MetricRecorder:
     def register_metric(self, metric: ModelMetric):
         self.metrics.append(metric)
 
-    def update(self, step, loss, preds, labels):
+    def update(self, step, **kwargs):
         results = {}
         for metric in self.metrics:
-            value = metric.update(step, loss, preds, labels)
+            value = metric.update(step, **kwargs)
             results[metric.get_name()] = value
         return results
 
@@ -190,24 +236,29 @@ class CharTokenizer:
             reader = csv.reader(file)
             for row in reader:
                 chars = chars + row
-        
+
         # Get rid of redundant character, and sort the characters
         chars = list(set(chars))
         chars.sort()
 
-
         # Merge vocab with special tokens and prepare reverse vocab
         self.vocab = {
-            SpecialTokens.SOS.value: 0,
-            SpecialTokens.BLANK.value: len(chars) + 1,
+            SpecialTokens.BLANK.value: 0,
+            SpecialTokens.SOS.value: len(chars) + 1,
             SpecialTokens.EOS.value: len(chars) + 2
         }
         for idx, char in enumerate(chars):
             self.vocab[char] = idx + 1
 
+        print(f"The vocavulary size is: {len(self.vocab)}")
+
         self.reverse_vocab = {v: k for k, v in self.vocab.items()}
-        
+
         self.device = device
+
+
+    def get_vocab_list(self):
+        return [self.reverse_vocab[i] for i in range(len(self.vocab))]
 
 
     def encode(self, t: str):
@@ -219,11 +270,13 @@ class CharTokenizer:
             Tensor of shape [str_len, vocab_size]
         """
 
-        indices = torch.tensor([self.vocab[SpecialTokens.SOS.value]] + [self.vocab.get(char, self.vocab[SpecialTokens.BLANK.value]) for char in t] + [self.vocab[SpecialTokens.EOS.value]], device=self.device)
+        t = [char for char in t if char in self.vocab]
+
+        indices = torch.tensor([self.vocab[SpecialTokens.SOS.value]] + [self.vocab[char] for char in t] + [self.vocab[SpecialTokens.EOS.value]], device=self.device)
 
         # Convert to one-hot and return
         #return F.one_hot(indices, num_classes=vocab_size)
-        return indices
+        return indices, t
 
 
     def decode(self, t: torch.Tensor, from_logits: bool = False, ctc: bool = False):
@@ -340,7 +393,7 @@ class Dataset(torch.utils.data.Dataset):
 
         # Resample the audio if necessary
         if sample_rate != self.target_sample_rate:
-            resampler = Resample(orig_freq=sample_rate, new_freq=self.target_sample_rate)
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=self.target_sample_rate)
             audio = resampler(audio)
 
         audio = whisper.pad_or_trim(audio.flatten()).to(self.device)
@@ -348,9 +401,9 @@ class Dataset(torch.utils.data.Dataset):
         # Load the transcript file and tokenize it.
         with open(transcript_file, 'r') as f:
             transcript = f.read()
-        tokens = self.tokenizer.encode(transcript)
+        tokens, transcript = self.tokenizer.encode(transcript)
 
-        return audio, tokens, tokens.shape[0], transcript
+        return audio, tokens, tokens.shape[0], transcript, self.tokenizer.get_eos_index()
 
 
     def get_tokenizer(self):
@@ -374,19 +427,26 @@ class Dataset(torch.utils.data.Dataset):
 
 
 def collate_fn(batch):
-    audios, tokens, lengths, transcripts = zip(*batch)
+    audios, tokens, lengths, transcripts, eos_idx = zip(*batch)
+
+    max_token_len = max(lengths)
 
     # collate only audios, tokens and lengths that have length > 0
     audios = [audio for idx, audio in enumerate(audios) if lengths[idx] > 0]
-    tokens = [token for idx, token in enumerate(tokens) if lengths[idx] > 0]
-    lengths = [length for length in lengths if length > 0]
-
-    # Concatenate the tokens and create target lengths
-    targets = torch.cat(tokens)
-    target_lens = torch.tensor(lengths, dtype=torch.long, device=targets.device)
-
     # audios have a shape of (audio_length), we need to build a tensor of shape (batch_size, audio_length)
     audios = torch.stack(audios)
+
+    tokens = [token for idx, token in enumerate(tokens) if lengths[idx] > 0]
+    # Pad tokens to max_len_tokens and stack them to create a tensor of shape [B,S]
+    tokens = [F.pad(token, (0, max_token_len - token.shape[0]), value=eos_idx[i]) for i, token in enumerate(tokens)]
+    targets = torch.stack(tokens)
+
+    lengths = [length for length in lengths if length > 0]
+    target_lens = torch.tensor(lengths, dtype=torch.long, device=audios.device)
+
+    # Concatenate the tokens and create target lengths
+    #targets = torch.cat(tokens)
+
     return audios, targets, target_lens, transcripts
 
 
@@ -396,14 +456,237 @@ class MixerMambaConfig:
     extractor_mode: str = field(default="layer_norm")
     conv_bias: bool = field(default=False)
     encoder_embed_dim: int = field(default=768)
+    decoder_embed_dim: int = field(default=256)
+    decoder_heads: int = field(default=8)
+    decoder_expand: int = field(default=4)
+    decoder_layers: int = field(default=2)
     vocab_file: str = field(default="/workspace/fairseq/data/vocab.csv")
     fe_dropout: float = field(default=0.0)
     encoder_layers: int = field(default=12)
+    mask_prob: int = field(default=0.5)
+    mask_length: int = field(default=10)
+    top_k_layers: int = field(default=8)
+    codebook_size: int = field(default=256)
+    n_codebooks: int = field(default=8)
+    codebook_init_decay: float = field(default=0.9) # TODO: set it up correctly
+    ema_decay: float = field(default=0.999) # TODO: set it up correctly
+
+
+class DinoSRModel(nn.Module):
+    def __init__(self, cfg: MixerMambaConfig, student: nn.Module):
+        super(DinoSRModel, self).__init__()
+        self.cfg = cfg
+
+        self.student = student
+
+        self.mask_prob = cfg.mask_prob
+        self.mask_length = cfg.mask_length
+        self.mask_emb = nn.Parameter(torch.randn(cfg.encoder_embed_dim))
+
+        self.codebook_size = cfg.codebook_size
+        self.n_codebooks = cfg.n_codebooks
+        self.codebook_decay = cfg.codebook_init_decay
+        self.heads = torch.nn.ModuleList([
+            nn.Linear(
+                cfg.encoder_embed_dim,
+                self.codebook_size
+            ) for _ in range(self.n_codebooks)
+        ])
+        self.ema_decay = cfg.ema_decay
+
+        codebooks = torch.randn(self.n_codebooks, cfg.encoder_embed_dim, self.codebook_size)
+        codebooks = F.instance_norm(codebooks).transpose(1, 2)
+        self.codebooks = {
+            i: codebooks[i] for i in range(self.n_codebooks)
+        }
+        self.codebook_cnts = {
+            i: torch.ones(self.codebook_size) for i in range(self.n_codebooks)
+        }
+
+        ema_cfg = EMAModuleConfig(
+            ema_decay=self.ema_decay,
+            ema_fp32=True,
+        )
+        self.teacher = EMAModule(student, ema_cfg)
+
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        # Get the state_dict from the superclass
+        state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+        
+        # Remove the student model's state_dict to avoid duplication
+        student_keys = [key for key in state.keys() if key.startswith(prefix + 'student.')]
+        for key in student_keys:
+            del state[key]
+        
+        # Save codebooks and codebook counts
+        for i in self.codebooks:
+            state[prefix + f'codebooks.{i}'] = self.codebooks[i]
+            state[prefix + f'codebook_cnts.{i}'] = self.codebook_cnts[i]
+        
+        # Save the mask embedding
+        state[prefix + 'mask_emb'] = self.mask_emb
+
+        # Save the teacher model's state_dict with a prefix
+        teacher_state = self.teacher.model.state_dict(destination=destination, prefix=prefix + 'teacher_model.', keep_vars=keep_vars)
+        if self.teacher.config.ema_fp32:
+            for key in self.teacher.fp32_params:
+                teacher_state[prefix + f'teacher_fp32_params.{key}'] = self.teacher.fp32_params[key]
+        state.update(teacher_state)
+
+        return state
+
+
+    def load_state_dict(self, state_dict, strict=True):
+        # Load codebooks and codebook counts
+        for i in self.codebooks:
+            self.codebooks[i] = state_dict.pop(f'codebooks.{i}')
+            self.codebook_cnts[i] = state_dict.pop(f'codebook_cnts.{i}')
+
+        # Load the mask embedding
+        self.mask_emb.data.copy_(state_dict.pop('mask_emb'))
+
+        # Load the teacher model's state_dict
+        teacher_model_state_dict = {
+            k.replace('teacher_model.', ''): v
+            for k, v in state_dict.items()
+            if k.startswith('teacher_model.')
+        }
+        self.teacher.model.load_state_dict(teacher_model_state_dict, strict=strict)
+
+        # Remove teacher model entries from state_dict
+        for key in list(state_dict.keys()):
+            if key.startswith('teacher_model.'):
+                del state_dict[key]
+
+        # Load teacher's fp32_params if ema_fp32 is True
+        if self.teacher.config.ema_fp32:
+            self.teacher.fp32_params = {}
+            fp32_keys = [k for k in state_dict.keys() if k.startswith('teacher_fp32_params.')]
+            for key in fp32_keys:
+                param_name = key.replace('teacher_fp32_params.', '')
+                self.teacher.fp32_params[param_name] = state_dict.pop(key)
+        
+        # Remove any remaining teacher_fp32_params entries from state_dict
+        for key in list(state_dict.keys()):
+            if key.startswith('teacher_fp32_params.'):
+                del state_dict[key]
+
+        # Remove student keys from state_dict to prevent duplication
+        student_keys = [key for key in state_dict.keys() if key.startswith('student.')]
+        for key in student_keys:
+            del state_dict[key]
+
+        # Call the superclass's load_state_dict to load remaining parameters
+        super().load_state_dict(state_dict, strict=False)
+
+
+    def ema_step(self):
+        self.teacher.step(self.student)
+
+
+    def to(self, device, *args, **kwargs):
+        self.codebooks = {
+            i: codebook.to(device) for i, codebook in self.codebooks.items()
+        }
+        self.codebook_cnts = {
+            i: codebook_cnt.to(device) for i, codebook_cnt in self.codebook_cnts.items()
+        }
+        # Handle teacher movement
+        self.teacher.model.to(device)
+        if self.teacher.config.ema_fp32:
+            for key in self.teacher.fp32_params:
+                self.teacher.fp32_params[key] = self.teacher.fp32_params[key].to(device)
+
+        return super().to(device, *args, **kwargs)
+
+
+    def forward(self, x):
+        features = x # x are the features after CNN feature extraction was applied to them.
+        B, T, _ = features.shape
+
+        # Copy the features for the teacher before applying the mask
+        pre_encoder_features = features.clone().to(x.device)
+
+        mask_indices = compute_mask_indices(
+            (B,T),
+            padding_mask=None,
+            mask_prob=self.mask_prob,
+            mask_length=self.mask_length,
+        )
+        mask_indices = torch.from_numpy(mask_indices).to(x.device)
+
+        x, layer_results = self.student(x)
+        layer_results = [
+            l[mask_indices] for l in layer_results # Changes the shape from [B,T,D] to [mask(B*T), D]
+        ]
+
+        with torch.no_grad():
+            self.teacher.model.eval()
+
+            # Calculate the teacher features
+            _, target_layer_results = self.teacher.model.extract_features(
+                pre_encoder_features,
+                min_layer=self.cfg.encoder_layers - self.cfg.top_k_layers,
+            )
+
+            # Apply instance normalization to the teacher features
+            target_layer_results = [rearrange(tl, 'b t d -> b d t') for tl in target_layer_results]
+            target_layer_results = [
+                F.instance_norm(tl) for tl in target_layer_results
+            ]
+            target_layer_results = [
+                rearrange(tl, 'b d t -> b t d') for tl in target_layer_results
+            ]
+
+            # Filter out target_layer_results
+            target_layer_results = [
+                tl[mask_indices] for tl in target_layer_results # Changes the shapr from [B,T,D] to [mask(B*T), D]
+            ]
+
+            x = x[mask_indices]
+
+        losses = 0.0
+        for i, (target, lr) in enumerate(zip(target_layer_results, layer_results)):
+            with torch.no_grad():
+                codebook = self.codebooks[i] / self.codebook_cnts[i].unsqueeze(1)
+
+                # Calculate teacher preds distance from codebook words. The total shape of neg_l2_dist is [B*T, CS]
+                neg_l2_dist = - (torch.sum(target**2, dim=1, keepdim=True) # shape [B*T, 1]
+                                + torch.sum(codebook**2, dim=1) # shape [CS]
+                                - 2 * torch.matmul(target, codebook.t()))
+
+                # Create onehot targets according to the maximum negative l2 distance
+                onehot_target = torch.zeros_like(neg_l2_dist)
+                onehot_target[range(len(neg_l2_dist)), neg_l2_dist.argmax(dim=1)] = 1.0
+
+            # Calculate loss
+            pred = self.heads[i](lr)
+            pred = F.log_softmax(pred, dim=-1)
+            loss = torch.sum(-onehot_target*pred, dim=-1)
+            losses += losses + loss
+
+            # Update codebook
+            count = onehot_target.sum(0)
+            memory = torch.matmul(onehot_target.t(), target)
+            alpha = torch.ones_like(count).unsqueeze(1)
+            alpha[count!=0] = self.codebook_decay
+            self.codebook_cnts[i] = alpha.squeeze(1) * self.codebook_cnts[i] + (1-alpha).squeeze(1) * count
+            self.codebooks[i] = alpha * self.codebooks[i] + (1-alpha) * memory
+
+        return (losses / self.n_codebooks).sum()
+
+
+def generate_causal_mask(seq_len, device):
+    # Create a lower triangular matrix filled with ones
+    mask = torch.tril(torch.ones(seq_len, seq_len).to(device))  # Only allow self-attention to previous positions
+    mask = mask.masked_fill(mask == 0, float('-inf'))  # Convert 0s to -inf (for masked positions)
+    mask = mask.masked_fill(mask == 1, float(0.0))     # Convert 1s to 0 (for non-masked positions)
+    return mask
 
 
 class MambaModel(nn.Module):
-
-    def __init__(self, config, vocab_size):
+    def __init__(self, config, tokenizer):
         """
         input: config - a yaml file defining the configuration of the model
         output: None
@@ -411,6 +694,11 @@ class MambaModel(nn.Module):
         """
         super(MambaModel, self).__init__()
         self.cfg = config
+
+        self.tokenizer = tokenizer
+
+        vocab_size = tokenizer.size()
+
         self.feature_extractor = ConvFeatureExtractionModel(
             conv_layers=eval(self.cfg.conv_feature_enc),
             dropout=self.cfg.fe_dropout,
@@ -420,11 +708,70 @@ class MambaModel(nn.Module):
 
         mamba_cfg = MambaConfig()
         mamba_cfg.d_model = self.cfg.encoder_embed_dim
-        mamba_cfg.vocab_size = vocab_size
+        mamba_cfg.vocab_size = self.cfg.decoder_embed_dim
         mamba_cfg.n_layer = self.cfg.encoder_layers
         self.encoder = MambaLMHeadModel(mamba_cfg)
 
-    def forward(self, audios):
+        self.dinosr = DinoSRModel(config, self.encoder)
+
+        self.decoder_embed = nn.Embedding(vocab_size, self.cfg.decoder_embed_dim)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.cfg.decoder_embed_dim,
+            nhead=self.cfg.decoder_heads,
+            dim_feedforward=self.cfg.decoder_embed_dim * self.cfg.decoder_expand,
+            batch_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=self.cfg.decoder_layers,
+        )
+        self.decoder_head = nn.Linear(self.cfg.decoder_embed_dim, vocab_size)
+
+
+    def run_dinosr(self, audios):
+        features = self.feature_extractor(audios)
+        features = rearrange(features, 'b d t -> b t d')
+        return self.dinosr(features)
+
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        # Get the state_dict from the superclass
+        state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+        # Remove the student model's state_dict from dinosr to avoid duplication
+        dinosr_state = self.dinosr.state_dict(destination=destination, prefix=prefix + 'dinosr.', keep_vars=keep_vars)
+        state.update(dinosr_state)
+
+        return state
+
+
+    def load_state_dict(self, state_dict, strict=True):
+        # Load the dinosr state dict
+        dinosr_keys = [k for k in state_dict.keys() if k.startswith('dinosr.')]
+        dinosr_state_dict = {k.replace('dinosr.', ''): state_dict[k] for k in dinosr_keys}
+        self.dinosr.load_state_dict(dinosr_state_dict, strict=strict)
+
+        # Remove dinosr entries from state_dict
+        for key in dinosr_keys:
+            del state_dict[key]
+
+        # Ensure that self.encoder and self.dinosr.student share parameters
+        self.dinosr.student = self.encoder
+
+        # Call the superclass's load_state_dict to load remaining parameters
+        super().load_state_dict(state_dict, strict=False)
+
+
+    def ema_step(self):
+        self.dinosr.ema_step()
+
+
+    def to(self, device, *args, **kwargs):
+        self.dinosr.to(device)
+        return super().to(device, *args, **kwargs)
+
+
+    def forward(self, audios, tokens):
         """
             input - audios: a tensor of shape (batch_size, audio_length)
             tokens: a tensor of shape (batch_size, transcript_length)
@@ -434,15 +781,106 @@ class MambaModel(nn.Module):
         features = rearrange(features, 'b d t -> b t d')
 
         # features have a shape of (batch_size, feature_length, feature_dim)
-        return self.encoder(features)
+        encoded_sr, layer_outputs = self.encoder(features) # sr stands for speech representation
+
+        token_embeddings = self.decoder_embed(tokens)
+        decoded_reps = self.decoder(tgt=token_embeddings, memory=encoded_sr, tgt_mask=generate_causal_mask(tokens.shape[1], tokens.device))
+
+        return self.decoder_head(decoded_reps)
+
+
+    def transcribe(self, audio, max_length=1000):
+        self.eval()
+        device = audio.device
+        tokenizer = self.tokenizer  # Assuming tokenizer is accessible
+
+        with torch.no_grad():
+            # Process audio through feature extractor
+            features = self.feature_extractor(audio.unsqueeze(0))  # [B, D, T]
+            features = rearrange(features, 'b d t -> b t d')  # [B, T, D]
+
+            # Pass through encoder
+            encoded_sr, _ = self.encoder(features)  # [B, T, D]
+
+            # Prepare decoder inputs
+            sos_idx = tokenizer.get_sos_index()
+            eos_idx = tokenizer.get_eos_index()
+            decoder_input = torch.tensor([sos_idx] * features.size(0), device=device).unsqueeze(1)  # [B, 1]
+            decoded_tokens = []
+
+            for _ in range(max_length):
+                # Get token embeddings
+                token_embeddings = self.decoder_embed(decoder_input)  # [B, S, D]
+
+                # Generate causal mask
+                tgt_mask = generate_causal_mask(token_embeddings.size(1), device)
+
+                # Pass through decoder
+                decoded_reps = self.decoder(
+                    tgt=token_embeddings,
+                    memory=encoded_sr,
+                    tgt_mask=tgt_mask,
+                )  # [B, S, D]
+
+                # Get logits for the last token
+                logits = self.decoder_head(decoded_reps)  # [B, S, V]
+                next_token_logits = logits[:, -1, :]  # [B, V]
+
+                # Get next token
+                next_token = torch.argmax(next_token_logits, dim=-1)  # [B]
+
+                # Append next token to decoder_input
+                decoder_input = torch.cat([decoder_input, next_token.unsqueeze(1)], dim=1)  # [B, S+1]
+
+                # Check for EOS
+                if next_token.item() == eos_idx:
+                    break
+                else:
+                    decoded_tokens.append(next_token.item())
+
+            # Convert tokens to string
+            transcription = ''.join([tokenizer.reverse_vocab.get(idx, '') for idx in decoded_tokens])
+            return transcription
+
+
+def lr_lambda(current_step, warmup_steps, saturation_steps, init_step=0):
+    current_step = max(1, current_step+init_step)
+    steps_until_decay = warmup_steps + saturation_steps
+    if current_step < warmup_steps:
+        return current_step / warmup_steps
+    elif current_step < steps_until_decay:
+        return 1.0
+    else:
+        return (steps_until_decay ** 0.5) / (current_step ** 0.5)
 
 
 def main():
+    arg_parser = ArgumentParser()
+    arg_parser.add_argument("-p", "--path", type=str, help="Path to the project directory")
+    arg_parser.add_argument("-c", "--config", type=str, default=None, help="Path to the config file, should be set if the model is new")
+    args = arg_parser.parse_args()
+
+    project_path = args.path
+    project_config_path = os.path.join(project_path, "config.yaml")
+    project_model_path = os.path.join(project_path, "last_model.pth")
+    project_best_model_path = os.path.join(project_path, "best_model.pth")
+    cfg_file = None
+    project_exists = False
+    if not os.path.exists(project_path) or not os.path.exists(project_config_path):
+        print("Project does not exist. Will create a new project.")
+        os.makedirs(project_path, exist_ok=True)
+        if not args.config:
+            raise ValueError("Config file should be provided for a new project.")
+        cfg_file = args.config
+    else:
+        print("Project exists. Will load the model.")
+        cfg_file = project_config_path
+        project_exists = True
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_file = "/workspace/fairseq/data/database.csv"
 
     # read the yaml file inside ./../config/s2t.yaml
-    cfg = yaml.safe_load(open("./../config/s2t.yaml"))
+    cfg = yaml.safe_load(open(cfg_file))
 
     dataset = Dataset(**cfg["dataset"], device=device)
     tokenizer = dataset.get_tokenizer()
@@ -451,26 +889,42 @@ def main():
     # Instantiate the metrics, and register them
     metric_recorder = MetricRecorder()
     metric_recorder.register_metric(LossMetric())
-    metric_recorder.register_metric(WERMetric(tokenizer))
+    metric_recorder.register_metric(AccuracyMetric())
+    metric_recorder.register_metric(LossMetric(name="dinosr_loss"))
+    metric_recorder.register_metric(LossMetric(name="ce_loss"))
 
     mixer_mamba_cfg = MixerMambaConfig(**cfg["model"])
 
-    model = MambaModel(mixer_mamba_cfg, dataset.get_vocab_size()).to(device)
-    if os.path.exists("best_model.pth"):
-        print("Loading the model.")
-        model.load_state_dict(torch.load("best_model.pth"))
-        print("Model loaded successfully.")
+    model = MambaModel(mixer_mamba_cfg, tokenizer).to(device)
+
+    if project_exists:
+        if os.path.exists("best_model.pth"):
+            print("Loading the model.")
+            model.load_state_dict(torch.load("best_model.pth"))
+            print("Model loaded successfully.")
+        else:
+            raise ValueError("Model file does not exist, in a project that exists.")
 
     # Print the model size
     print(f"Model size: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
-    optimizer = getattr(torch.optim, cfg["optimizer"]["name"])(model.parameters(), **cfg["optimizer"]["params"])
+    optimizer = getattr(torch.optim, cfg["optimizer"]["name"])(
+        model.parameters(),
+        **cfg["optimizer"]["params"]
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: lr_lambda(
+            step,
+            cfg["optimization"]["warmup_steps"],
+            cfg["optimization"]["init_step"]
+        )
+    )
     criterion = getattr(nn, cfg["criterion"]["name"])(**cfg["criterion"]["params"])
 
     update_freq = cfg["optimization"]["update_freq"]
-
-    best_loss = None
-
+    best_loss = cfg["checkpoint"]["best_loss"]
+    run_dinosr = cfg["optimization"]["run_dinosr"]
 
     for epoch in range(50):
         print(f"Epoch {epoch}")
@@ -481,25 +935,42 @@ def main():
 
         for step, (audios, tokens, token_lens, transcripts) in enumerate(progress_bar):
             # the model output have no softmax applied to it.
-            logits, _ = model(audios)
-            if torch.isnan(logits).any() or torch.isinf(logits).any():
-                print("Logits are NaN")
-                continue
-            log_probs = F.log_softmax(logits, dim=-1)
+            logits = model(audios, tokens)
+
+            # Calculate dinosr loss
+            if run_dinosr:
+                dinosr_loss = model.run_dinosr(audios) / update_freq
+
+            # Compute targets
+            targets = torch.roll(tokens, -1, dims=1)
+            targets[:, -1] = tokenizer.get_eos_index()
 
             # Calculate loss
-            input_lens = torch.full((log_probs.shape[0],), log_probs.shape[1], device=log_probs.device, dtype=torch.long)
-            log_probs = rearrange(log_probs, 'b t v -> t b v')
-            loss = criterion(log_probs, tokens, input_lens, token_lens) / update_freq
+            ce_loss = criterion(
+                input=rearrange(logits, 'b t c -> ( b t ) c'),
+                target=rearrange(targets, 'b t -> (b t)'),
+            )
+            loss = ce_loss
+            ce_loss = ce_loss.item()
+
+            # Add dinosr loss to the total loss
+            if run_dinosr:
+                loss += dinosr_loss * cfg["optimization"]["dinosr_lambda"]
+
+            # Update and calculate the metrics
+            metrics = metric_recorder.update(
+                step,
+                loss=loss.item(),
+                logits=logits,
+                labels=targets,
+                dinosr_loss=dinosr_loss.item(),
+                ce_loss=ce_loss)
 
             # Perform a backprop to calculate the new gradients
-            if torch.isnan(loss):
+            if torch.isnan(loss) or torch.isinf(loss):
                 print("Loss is NaN")
                 continue
             loss.backward()
-
-            # Update and calculate the metrics
-            metrics = metric_recorder.update(step, loss.item(), logits, transcripts)
 
             if (step + 1) % update_freq == 0:
                 # Clip the gradients
@@ -507,26 +978,37 @@ def main():
 
                 # Perform an optimizer step
                 optimizer.step()
+                if run_dinosr:
+                    model.ema_step()
+                scheduler.step()
 
                 # Zero out the gradient state of the model parameters.
                 optimizer.zero_grad()
 
+                # empty cache, to free up memory
+                torch.cuda.empty_cache()
+
+
+            if (step + 1) % cfg["checkpoint"]["save_interval"] == 0:
+                # Save the model
+                torch.save(model.state_dict(), project_model_path)
+
                 # TODO:  This is temporary and should change
-                if not best_loss:
+                if best_loss > metrics["loss"]:
                     best_loss = metrics["loss"]
-                    # save the model
-                    torch.save(model.state_dict(), "tmp.pth")
-                    os.system("cp tmp.pth best_model.pth")
-                elif best_loss > metrics["loss"]:
-                    best_loss = metrics["loss"]
-                    torch.save(model.state_dict(), "tmp.pth")
-                    os.system("cp tmp.pth best_model.pth")
+                    cfg["checkpoint"]["best_loss"] = best_loss
+                    torch.save(model.state_dict(), project_best_model_path)
+
+                cfg["optimization"]["init_step"] = (step + 1) // update_freq
+                with open(project_config_path, "w") as f:
+                    yaml.dump(cfg, f)
 
             progress_bar.set_postfix(**metrics)
 
             if step % cfg["generation"]["freq"] == 0:
-                print(tokenizer.decode(logits, from_logits=True, ctc=True))
-
+                # Generate a transcription
+                transcription = model.transcribe(audios[0])
+                print(f"Transcription: {transcription}")
 
 if __name__ == '__main__':
     main()
